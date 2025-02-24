@@ -93,7 +93,7 @@ in
           submodule (
             { name, config, ... }:
             recursiveUpdate
-              (import ./options.nix {
+              (import ./submodule-options.nix {
                 inherit pkgs lib name config;
                 user = "root";
                 group = "root";
@@ -109,7 +109,7 @@ in
                       type = attrsOf (
                         submodule (
                           { name, config, ... }:
-                          import ./options.nix {
+                          import ./submodule-options.nix {
                             inherit pkgs lib;
                             config = outerConfig // config;
                             name = outerName;
