@@ -13,7 +13,6 @@ let
     types
     foldl'
     unique
-    concatMap
     concatMapStrings
     listToAttrs
     escapeShellArg
@@ -25,14 +24,13 @@ let
     concatStringsSep
     concatMapStringsSep
     catAttrs
-    optional
+    optionals
     optionalString
     literalExpression
     elem
     intersectLists
     any
     id
-    head
     ;
 
   inherit (types)
@@ -42,18 +40,18 @@ let
 
   inherit (utils)
     escapeSystemdPath
-    fsNeededForBoot
+    pathsNeededForBoot
     ;
 
   inherit (pkgs.callPackage ./lib.nix { })
-    splitPath
     concatPaths
     parentsOf
     duplicates
     ;
 
+  inherit (config.users) users;
+
   cfg = config.environment.persistence;
-  users = config.users.users;
   allPersistentStoragePaths = zipAttrsWith (_name: flatten) (filter (v: v.enable) (attrValues cfg));
   inherit (allPersistentStoragePaths) files directories;
   mountFile = pkgs.runCommand "impermanence-mount-file" { buildInputs = [ pkgs.bash ]; } ''
@@ -66,22 +64,6 @@ let
     user = "root";
     group = "root";
   };
-
-  # Create fileSystems bind mount entry.
-  mkBindMountNameValuePair = { dirPath, persistentStoragePath, hideMount, ... }: {
-    name = concatPaths [ "/" dirPath ];
-    value = {
-      device = concatPaths [ persistentStoragePath dirPath ];
-      noCheck = true;
-      options = [ "bind" "X-fstrim.notrim" ]
-        ++ optional hideMount "x-gvfs-hide";
-      depends = [ persistentStoragePath ];
-    };
-  };
-
-  # Create all fileSystems bind mount entries for a specific
-  # persistent storage path.
-  bindMounts = listToAttrs (map mkBindMountNameValuePair directories);
 in
 {
   options = {
@@ -97,6 +79,7 @@ in
                 inherit pkgs lib name config;
                 user = "root";
                 group = "root";
+                homeDir = null;
               })
               {
                 options = {
@@ -116,6 +99,7 @@ in
                             usersOpts = true;
                             user = name;
                             group = users.${name}.group;
+                            homeDir = users.${name}.home;
                           }
                         )
                       );
@@ -197,10 +181,6 @@ in
         }
       '';
     };
-
-    # Forward declare a dummy option for VM filesystems since the real one won't exist
-    # unless the VM module is actually imported.
-    virtualisation.fileSystems = mkOption { };
   };
 
   config = mkIf (allPersistentStoragePaths != { })
@@ -239,9 +219,42 @@ in
           in
           foldl' recursiveUpdate { } (map mkPersistFileService files);
 
-        fileSystems = mkIf (directories != [ ]) bindMounts;
-        # So the mounts still make it into a VM built from `system.build.vm`
-        virtualisation.fileSystems = mkIf (directories != [ ]) bindMounts;
+        boot.initrd.systemd.mounts =
+          let
+            mkBindMount = { dirPath, persistentStoragePath, hideMount, ... }: {
+              wantedBy = [ "initrd.target" ];
+              before = [ "initrd-nixos-activation.service" ];
+              where = concatPaths [ "/sysroot" dirPath ];
+              what = concatPaths [ "/sysroot" persistentStoragePath dirPath ];
+              unitConfig.DefaultDependencies = false;
+              type = "none";
+              options = concatStringsSep "," ([
+                "bind"
+              ] ++ optionals hideMount [
+                "x-gvfs-hide"
+              ]);
+            };
+            dirs = filter (d: elem d.dirPath pathsNeededForBoot) directories;
+          in
+          map mkBindMount dirs;
+
+        systemd.mounts =
+          let
+            mkBindMount = { dirPath, persistentStoragePath, hideMount, ... }: {
+              wantedBy = [ "local-fs.target" ];
+              before = [ "local-fs.target" ];
+              where = concatPaths [ "/" dirPath ];
+              what = concatPaths [ persistentStoragePath dirPath ];
+              unitConfig.DefaultDependencies = false;
+              type = "none";
+              options = concatStringsSep "," ([
+                "bind"
+              ] ++ optionals hideMount [
+                "x-gvfs-hide"
+              ]);
+            };
+          in
+          map mkBindMount directories;
 
         system.activationScripts =
           let
@@ -429,87 +442,20 @@ in
             };
           };
 
-        # Create the mountpoints of directories marked as needed for boot
-        # which are also persisted. For this to work, it has to run at
-        # early boot, before NixOS' filesystem mounting runs. Without
-        # this, initial boot fails when for example /var/lib/nixos is
-        # persisted but not created in persistent storage.
-        boot.initrd =
+        boot.initrd.postMountCommands =
           let
-            neededForBootFs = catAttrs "mountPoint" (filter fsNeededForBoot (attrValues config.fileSystems));
-            neededForBootDirs = filter (dir: elem dir.dirPath neededForBootFs) directories;
-            getDevice = fs:
-              if fs.device != null then
-                fs.device
-              else if fs.label != null then
-                "/dev/disk/by-label/${fs.label}"
-              else
-                "none";
-            mkMount = fs:
+            neededForBootDirs = filter (dir: elem dir.dirPath pathsNeededForBoot) directories;
+            mkBindMount = { persistentStoragePath, dirPath, ... }:
               let
-                mountPoint = concatPaths [ "/persist-tmp-mnt" fs.mountPoint ];
-                device = getDevice fs;
-                options = filter (o: (builtins.match "(x-.*\.mount)" o) == null) fs.options;
-                optionsFlag = optionalString (options != [ ]) ("-o " + escapeShellArg (concatStringsSep "," options));
+                target = concatPaths [ "/mnt-root" persistentStoragePath dirPath ];
               in
               ''
-                mkdir -p ${escapeShellArg mountPoint}
-                mount -t ${escapeShellArgs [ fs.fsType device mountPoint ]} ${optionsFlag}
+                mkdir -p ${escapeShellArg target}
+                mountFS ${escapeShellArgs [ target dirPath ]} bind none
               '';
-            mkDir = { persistentStoragePath, dirPath, ... }: ''
-              mkdir -p ${escapeShellArg (concatPaths [ "/persist-tmp-mnt" persistentStoragePath dirPath ])}
-            '';
-            mkUnmount = fs: ''
-              umount ${escapeShellArg (concatPaths [ "/persist-tmp-mnt" fs.mountPoint ])}
-            '';
-            fileSystems =
-              let
-                persistentStoragePaths = unique (catAttrs "persistentStoragePath" directories);
-                all = config.fileSystems // config.virtualisation.fileSystems;
-                matchFileSystems = fs: attrValues (filterAttrs (_: v: v.mountPoint or null == fs) all);
-              in
-              concatMap matchFileSystems persistentStoragePaths;
-            deviceUnits = unique
-              (concatMap
-                (fs:
-                  # If the device path starts with “dev” or “sys”,
-                  # it's a real device and should have an associated
-                  # .device unit. If not, it's probably either a
-                  # temporary file system lacking a backing device, a
-                  # ZFS pool or a bind mount.
-                  let
-                    device = getDevice fs;
-                  in
-                  if elem (head (splitPath [ device ])) [ "dev" "sys" ] then
-                    [ "${escapeSystemdPath device}.device" ]
-                  else if device == "none" || device == fs.fsType then
-                    [ ]
-                  else if fs.fsType == "zfs" then
-                    [ "zfs-import.target" ]
-                  else
-                    [ "${escapeSystemdPath device}.mount" ])
-                fileSystems);
-            createNeededForBootDirs = ''
-              ${concatMapStrings mkMount fileSystems}
-              ${concatMapStrings mkDir neededForBootDirs}
-              ${concatMapStrings mkUnmount fileSystems}
-            '';
           in
-          {
-            systemd.services = mkIf config.boot.initrd.systemd.enable {
-              create-needed-for-boot-dirs = {
-                wantedBy = [ "initrd-root-device.target" ];
-                requires = deviceUnits;
-                after = deviceUnits;
-                before = [ "sysroot.mount" ];
-                serviceConfig.Type = "oneshot";
-                unitConfig.DefaultDependencies = false;
-                script = createNeededForBootDirs;
-              };
-            };
-            postResumeCommands = mkIf (!config.boot.initrd.systemd.enable)
-              (mkAfter createNeededForBootDirs);
-          };
+          mkIf (!config.boot.initrd.systemd.enable)
+            (mkAfter (concatMapStrings mkBindMount neededForBootDirs));
       }
 
       # Work around an issue with persisting /etc/machine-id where the
@@ -533,10 +479,6 @@ in
               else
                 cond;
             persistentStoragePaths = attrNames cfg;
-            usersPerPath = allPersistentStoragePaths.users;
-            homeDirOffenders =
-              filterAttrs
-                (n: v: (v.home != config.users.users.${n}.home));
           in
           [
             {
@@ -554,32 +496,6 @@ in
 
                       Please fix or remove the following paths:
                         ${concatStringsSep "\n      " offenders}
-                '';
-            }
-            {
-              assertion = all (users: (homeDirOffenders users) == { }) usersPerPath;
-              message =
-                let
-                  offendersPerPath = filter (users: (homeDirOffenders users) != { }) usersPerPath;
-                  offendersText =
-                    concatMapStringsSep
-                      "\n      "
-                      (offenders:
-                        concatMapStringsSep
-                          "\n      "
-                          (n: "${n}: ${offenders.${n}.home} != ${config.users.users.${n}.home}")
-                          (attrNames offenders))
-                      offendersPerPath;
-                in
-                ''
-                  environment.persistence:
-                      Users and home doesn't match:
-                        ${offendersText}
-
-                      You probably want to set each
-                      environment.persistence.<path>.users.<user>.home to
-                      match the respective user's home directory as
-                      defined by users.users.<user>.home.
                 '';
             }
             {
