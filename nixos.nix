@@ -85,6 +85,20 @@ let
     patchShebangs $out
   '';
 
+  mkPersistFile = { filePath, persistentStoragePath, enableDebugging, ... }:
+    let
+      mountPoint = filePath;
+      targetFile = concatPaths [ persistentStoragePath filePath ];
+      args = escapeShellArgs [
+        mountPoint
+        targetFile
+        enableDebugging
+      ];
+    in
+    ''
+      ${mountFile} ${args}
+    '';
+
   defaultPerms = {
     mode = "0755";
     user = "root";
@@ -212,9 +226,9 @@ in
           {
             systemd.services =
               let
-                mkPersistFileService = { filePath, persistentStoragePath, enableDebugging, ... }:
+                mkPersistFileService = { filePath, persistentStoragePath, ... }@args:
                   let
-                    targetFile = escapeShellArg (concatPaths [ persistentStoragePath filePath ]);
+                    targetFile = concatPaths [ persistentStoragePath filePath ];
                     mountPoint = escapeShellArg filePath;
                   in
                   {
@@ -227,7 +241,7 @@ in
                       serviceConfig = {
                         Type = "oneshot";
                         RemainAfterExit = true;
-                        ExecStart = "${mountFile} ${mountPoint} ${targetFile} ${escapeShellArg enableDebugging}";
+                        ExecStart = mkPersistFile args;
                         ExecStop = pkgs.writeShellScript "unbindOrUnlink-${escapeSystemdPath targetFile}" ''
                           set -eu
                           if [[ -L ${mountPoint} ]]; then
@@ -432,20 +446,6 @@ in
                     trap "_status=1" ERR
                     ${concatMapStrings mkDirWithPerms allDirs}
                     exit $_status
-                  '';
-
-                mkPersistFile = { filePath, persistentStoragePath, enableDebugging, ... }:
-                  let
-                    mountPoint = filePath;
-                    targetFile = concatPaths [ persistentStoragePath filePath ];
-                    args = escapeShellArgs [
-                      mountPoint
-                      targetFile
-                      enableDebugging
-                    ];
-                  in
-                  ''
-                    ${mountFile} ${args}
                   '';
 
                 persistFileScript =
