@@ -45,7 +45,7 @@ in
         }
       ));
   };
-  config = {
+  config = lib.mkIf (cfg != {}) {
     _module.args = {
       persistenceModuleImported = false;
     };
