@@ -1,4 +1,4 @@
-{ pkgs, config, options, lib, utils, ... }:
+{ pkgs, config, lib, utils, ... }:
 
 let
   inherit (lib)
@@ -35,10 +35,6 @@ let
   inherit (types)
     attrsOf
     submodule
-    ;
-
-  inherit (lib.modules)
-    importApply
     ;
 
   inherit (utils)
@@ -80,7 +76,7 @@ let
         in
         filter (v: v.enable) paths;
     in
-    zipAttrsWith (_: flatten) (nixos ++ nixosUsers ++ homeManager);
+    zipAttrsWith (_: v: flatten v) (nixos ++ nixosUsers ++ homeManager);
 
   inherit (allPersistentStoragePaths) files directories;
 
@@ -112,19 +108,21 @@ let
 in
 {
   options = {
+    home-manager.extraSpecialArgs = mkOption { };
+
     environment.persistence = mkOption {
       default = { };
       type =
         attrsOf (
-          submodule [
-            ({ name, config, ... }:
-              (importApply ./submodule-options.nix {
+          submodule (
+            { name, config, ... }:
+            recursiveUpdate
+              (import ./submodule-options.nix {
                 inherit pkgs lib name config;
                 user = "root";
                 group = "root";
                 homeDir = null;
-              }))
-            ({ name, config, ... }:
+              })
               {
                 options = {
                   users =
@@ -136,7 +134,7 @@ in
                       type = attrsOf (
                         submodule (
                           { name, config, ... }:
-                          importApply ./submodule-options.nix {
+                          import ./submodule-options.nix {
                             inherit pkgs lib;
                             config = outerConfig // config;
                             name = outerName;
@@ -183,8 +181,8 @@ in
                       '';
                     };
                 };
-              })
-          ]
+              }
+          )
         );
       description = ''
         A set of persistent storage location submodules listing the
@@ -221,9 +219,9 @@ in
 
   config =
     mkMerge [
-      (lib.optionalAttrs (options ? home-manager.extraSpecialArgs) {
+      {
         home-manager.extraSpecialArgs.persistenceModuleImported = true;
-      })
+      }
       (mkIf (allPersistentStoragePaths != { })
         (mkMerge [
           {
